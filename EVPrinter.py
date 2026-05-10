@@ -17,7 +17,9 @@
 import sqlite3
 import asyncio
 import logging
+import os
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
 
 from telegram import (
     Update,
@@ -36,8 +38,11 @@ from telegram.ext import (
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-BOT_TOKEN   = "8436149771:AAEPl9DoNCV43zKX7w2sUCg9xBmfEanEQKA"          # ← Replace with your token
-ADMIN_IDS   = [697702193]                    # ← Replace with your Telegram ID(s)
+load_dotenv()
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN environment variable is required")
+ADMIN_IDS   = [980603656]                    # ← Replace with your Telegram ID(s)
 
 PRINTERS    = ["H2D", "A1", "P2S"]          # Adjust if you add a 4th printer
 
@@ -68,7 +73,7 @@ CREATE TABLE IF NOT EXISTS print_jobs (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     printer       TEXT    NOT NULL,
     telegram_id   INTEGER NOT NULL,
-    student_id    TEXT    NOT NULL,
+    student_id    INTEGER    NOT NULL,
     full_name     TEXT    NOT NULL,
     filament      TEXT    NOT NULL,
     colour        TEXT    NOT NULL,
@@ -95,7 +100,7 @@ def db_active_job(printer: str):
     """Return the active (printing) job for a printer, or None."""
     cursor.execute(
         "SELECT id, telegram_id, full_name, duration_min, started_at FROM print_jobs "
-        "WHERE printer=? AND status='printing' ORDER BY id LIMIT 1",
+        "WHERE printer=? AND status IN('printing', 'waiting_clear') ORDER BY id LIMIT 1",
         (printer,)
     )
     return cursor.fetchone()
@@ -227,7 +232,15 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         queued = db_queue_count(p)
         if active:
             job_id, tid, name, dur, started = active
-            if started:
+            cursor.execute("SELECT status FROM print_jobs WHERE id=?", (job_id,))
+            status = cursor.fetchone()[0]
+            if status == "waiting_clear":
+                lines.append(
+                    f"*{p}* 🟡 Finished — waiting for bed clearance\n"
+                    f"  👤 {name}\n"
+                    f"  📋 Queue: {queued} waiting"
+                )
+            elif started:
                 start_dt  = datetime.fromisoformat(started)
                 end_dt    = start_dt + timedelta(minutes=dur)
                 rem_secs  = max(0, int((end_dt - datetime.now()).total_seconds()))
@@ -390,12 +403,23 @@ async def print_alarm(
     """Wait for the print to finish, then ping every 30 s until bed is cleared."""
     await asyncio.sleep(duration_min * 60)
 
+    cursor.execute(
+        "UPDATE print_jobs SET status='waiting_clear' WHERE id=? AND status='printing'",
+        (job_id,)
+    )
+    conn.commit()
+
+    cursor.execute("SELECT status FROM print_jobs WHERE id=?", (job_id,))
+    row = cursor.fetchone()
+    if not row or row[0] != "waiting_clear":
+        return
+
     ring_count = 0
     while True:
         # Stop ringing if job was marked done (bed cleared) or cancelled
         cursor.execute("SELECT status FROM print_jobs WHERE id=?", (job_id,))
         row = cursor.fetchone()
-        if not row or row[0] != "printing":
+        if not row or row[0] in ('done', 'cancelled'):
             break
 
         ring_count += 1
@@ -551,7 +575,7 @@ async def cmd_myjobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tid = update.effective_user.id
     cursor.execute(
         "SELECT printer, filament, colour, duration_min, status, started_at "
-        "FROM print_jobs WHERE telegram_id=? AND status IN ('printing','queued') ORDER BY id",
+        "FROM print_jobs WHERE telegram_id=? AND status IN ('printing','queued', 'waiting_clear') ORDER BY id",
         (tid,),
     )
     jobs = cursor.fetchall()
@@ -562,7 +586,11 @@ async def cmd_myjobs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for p, f, c, dur, st, sa in jobs:
         h, m = divmod(dur, 60)
         dur_str = f"{h}h {m}m" if h else f"{m}m"
-        if st == "printing" and sa:
+        if st == "waiting_clear":
+            lines.append(
+                    f"*{p}* 🟡 Finished — waiting for bed clearance\n"
+                )
+        elif st == "printing" and sa:
             end_dt    = datetime.fromisoformat(sa) + timedelta(minutes=dur)
             rem_secs  = max(0, int((end_dt - datetime.now()).total_seconds()))
             rh, rm    = divmod(rem_secs // 60, 60)
